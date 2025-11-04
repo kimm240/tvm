@@ -984,6 +984,405 @@ void ReverseComputeInline(ScheduleState self, const StmtSRef& consumer_block_sre
   ReverseComputeInlineImpl(self, consumer_block_sref);
 }
 
+/*!
+ * \brief Helper to fuse epilogue block into reduction block
+ * Analyzes epilogue pattern and transforms reduction init/update
+ */
+class ReductionEpilogueFuser : public BaseInliner {
+ public:
+  explicit ReductionEpilogueFuser(const Buffer& reduction_buffer,
+                                  const BlockNode* reduction_block,
+                                  const BlockRealize& epilogue_block_realize,
+                                  const StmtSRef& scope_root_sref, const IRModule& mod)
+      : BaseInliner(reduction_buffer, epilogue_block_realize->block, scope_root_sref),
+        reduction_block_(reduction_block),
+        epilogue_block_(epilogue_block_realize->block.get()),
+        mod_(mod) {}
+
+  bool BodyPatternAllowFusion(const BlockRealize& epilogue_block_realize);
+
+  // Step 2: 단일 fused reduction 블록 생성
+  Block CreateFusedReductionBlock(const BlockNode* reduction_block,
+                                   const BlockRealizeNode* reduction_realize);
+
+ private:
+  bool AnalyzeEpiloguePattern(const PrimExpr& value);
+  bool IsReductionBlock(const BlockNode* block);
+  void ExtractEpilogueInfo();
+  
+  // Helper function to extract BufferLoad nodes from BufferStore
+  static std::vector<const BufferLoadNode*> ExtractBufferLoad(const Buffer& buffer,
+                                                              const BufferStoreNode* from) {
+    struct Extractor : public ExprVisitor {
+      void VisitExpr_(const BufferLoadNode* load) final {
+        if (load->buffer.get() == buffer) {
+          result.push_back(load);
+        }
+        ExprVisitor::VisitExpr_(load);
+      }
+      const BufferNode* buffer;
+      std::vector<const BufferLoadNode*> result;
+    } extractor;
+    extractor.buffer = buffer.get();
+    for (const PrimExpr& expr : from->indices) {
+      extractor(expr);
+    }
+    extractor(from->value);
+    return std::move(extractor.result);
+  }
+
+  const BlockNode* reduction_block_;
+  const BlockNode* epilogue_block_;
+  const IRModule& mod_;
+  PrimExpr epilogue_addend_{nullptr};  // C[vi, vj] in D = temp + C
+  Buffer epilogue_output_buffer_{nullptr};  // D 버퍼
+  ffi::Array<PrimExpr> epilogue_output_indices_{nullptr};  // D[vi, vj]의 인덱스
+  BufferRegion epilogue_output_region_{nullptr};  // D의 write region
+  Buffer epilogue_addend_buffer_{nullptr};  // C 버퍼
+  BufferRegion epilogue_addend_region_{nullptr};  // C의 read region
+};
+
+bool ReductionEpilogueFuser::BodyPatternAllowFusion(
+    const BlockRealize& epilogue_block_realize) {
+  const Block& epilogue_block = epilogue_block_realize->block;
+
+  // 1. Predicate 검증 (기존 코드 참고)
+  if (!is_one(epilogue_block_realize->predicate)) {
+    // Failure: Predicate in epilogue block is not supported
+    return false;
+  }
+
+  // 2. Epilogue body가 BufferStore인지 확인
+  if (inlined_store_ == nullptr) {
+    // Failure: epilogue block body is not BufferStore
+    return false;
+  }
+
+  // 3. Epilogue가 reduction 버퍼를 읽는지 확인
+  std::vector<const BufferLoadNode*> loads =
+      ExtractBufferLoad(inlined_buffer_, inlined_store_);
+  if (loads.size() == 0) {
+    // Failure: no BufferLoad from the reduction buffer
+    return false;
+  }
+
+  // 4. Epilogue 패턴 분석: D[i,j] = temp[i,j] + C[i,j] 형태인지 확인
+  if (!AnalyzeEpiloguePattern(inlined_store_->value)) {
+    // Failure: epilogue is not a simple addition pattern
+    return false;
+  }
+
+  // 5. Reduction 블록이 실제로 reduction인지 확인
+  if (!IsReductionBlock(reduction_block_)) {
+    // Failure: producer is not a reduction block
+    return false;
+  }
+
+  // 6. Epilogue 정보 추출 (출력 버퍼, 인덱스, region 등)
+  ExtractEpilogueInfo();
+
+  return true;
+}
+
+bool ReductionEpilogueFuser::AnalyzeEpiloguePattern(const PrimExpr& value) {
+  // Pattern: temp[i,j] + C[i,j] 또는 C[i,j] + temp[i,j]
+  if (const auto* add = value.as<AddNode>()) {
+    // Check if one operand is BufferLoad from reduction buffer
+    const auto* load_a = add->a.as<BufferLoadNode>();
+    const auto* load_b = add->b.as<BufferLoadNode>();
+
+    if (load_a && load_a->buffer.same_as(inlined_buffer_)) {
+      // Pattern: temp[...] + C[...]
+      epilogue_addend_ = add->b;
+      return true;
+    } else if (load_b && load_b->buffer.same_as(inlined_buffer_)) {
+      // Pattern: C[...] + temp[...]
+      epilogue_addend_ = add->a;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool ReductionEpilogueFuser::IsReductionBlock(const BlockNode* block) {
+  // Check if block has reduction iter vars
+  for (const IterVar& iter : block->iter_vars) {
+    if (iter->iter_type == kCommReduce) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void ReductionEpilogueFuser::ExtractEpilogueInfo() {
+  // Extract epilogue output buffer and indices
+  epilogue_output_buffer_ = inlined_store_->buffer;
+  epilogue_output_indices_ = inlined_store_->indices;
+
+  // Extract epilogue output region from epilogue block writes
+  for (const BufferRegion& write : epilogue_block_->writes) {
+    if (write->buffer.same_as(epilogue_output_buffer_)) {
+      epilogue_output_region_ = write;
+      break;
+    }
+  }
+
+  // Extract epilogue addend buffer and region from epilogue_addend_
+  if (const auto* load = epilogue_addend_.as<BufferLoadNode>()) {
+    epilogue_addend_buffer_ = load->buffer;
+    // Find the read region from epilogue block reads
+    for (const BufferRegion& read : epilogue_block_->reads) {
+      if (read->buffer.same_as(epilogue_addend_buffer_)) {
+        epilogue_addend_region_ = read;
+        break;
+      }
+    }
+  }
+}
+
+Block ReductionEpilogueFuser::CreateFusedReductionBlock(const BlockNode* reduction_block,
+                                                         const BlockRealizeNode* reduction_realize) {
+  ObjectPtr<BlockNode> new_block = ffi::make_object<BlockNode>(*reduction_block);
+
+  // 1. 모든 iter vars 유지 (data parallel + reduction)
+  new_block->iter_vars = reduction_block->iter_vars;
+
+  // 2. Epilogue block의 vars를 reduction block의 vars로 매핑
+  std::unordered_map<Var, Var> var_map;
+  int reduction_data_par_idx = 0;
+  for (int i = 0; i < static_cast<int>(reduction_block->iter_vars.size()); ++i) {
+    const IterVar& iter_var = reduction_block->iter_vars[i];
+    if (iter_var->iter_type == IterVarType::kDataPar) {
+      // Epilogue block의 해당 data parallel var와 매핑
+      int epilogue_data_par_idx = 0;
+      for (const IterVar& epilogue_iter_var : epilogue_block_->iter_vars) {
+        if (epilogue_iter_var->iter_type == IterVarType::kDataPar) {
+          if (epilogue_data_par_idx == reduction_data_par_idx) {
+            var_map[epilogue_iter_var->var] = iter_var->var;
+            break;
+          }
+          epilogue_data_par_idx++;
+        }
+      }
+      reduction_data_par_idx++;
+    }
+  }
+
+  // 3. Init을 epilogue 값으로 변경: D[vi, vj] = C[vi, vj]
+  BufferStore new_init_store(
+      epilogue_output_buffer_,
+      Substitute(epilogue_addend_, var_map),
+      Substitute(epilogue_output_indices_, var_map)
+  );
+  new_block->init = new_init_store;
+
+  // 4. Body의 출력 버퍼를 temp → D로 변경
+  class BufferReplacer : public StmtExprMutator {
+   public:
+    BufferReplacer(Buffer old_buf, Buffer new_buf) : old_buffer_(old_buf), new_buffer_(new_buf) {}
+
+    Stmt VisitStmt_(const BufferStoreNode* op) final {
+      BufferStore store = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
+      if (store->buffer.same_as(old_buffer_)) {
+        return BufferStore(new_buffer_, store->value, store->indices);
+      }
+      return store;
+    }
+
+    PrimExpr VisitExpr_(const BufferLoadNode* op) final {
+      BufferLoad load = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
+      if (load->buffer.same_as(old_buffer_)) {
+        return BufferLoad(new_buffer_, load->indices);
+      }
+      return load;
+    }
+
+   private:
+    Buffer old_buffer_;
+    Buffer new_buffer_;
+  };
+
+  BufferReplacer replacer(inlined_buffer_, epilogue_output_buffer_);
+  new_block->body = replacer(reduction_block->body);
+
+  // 5. Write regions 업데이트
+  ffi::Array<BufferRegion> new_writes;
+  for (const BufferRegion& write : reduction_block->writes) {
+    if (write->buffer.same_as(inlined_buffer_)) {
+      new_writes.push_back(BufferRegion(epilogue_output_buffer_,
+                                        Substitute(write->region, var_map)));
+    } else {
+      new_writes.push_back(write);
+    }
+  }
+  new_block->writes = new_writes;
+
+  // 6. Read regions 업데이트 (C를 먼저, 그 다음 A, B)
+  ffi::Array<BufferRegion> new_reads;
+  std::unordered_set<const BufferNode*> read_bufs;
+
+  // C 버퍼 읽기를 먼저 추가 (init에서 사용)
+  if (epilogue_addend_buffer_.defined()) {
+    new_reads.push_back(BufferRegion(epilogue_addend_buffer_,
+                                     Substitute(epilogue_addend_region_->region, var_map)));
+    read_bufs.insert(epilogue_addend_buffer_.get());
+  }
+
+  // 기존 read regions 추가 (A, B 등)
+  for (const BufferRegion& read : reduction_block->reads) {
+    if (!read->buffer.same_as(inlined_buffer_)) {
+      // temp 버퍼가 아닌 경우만 추가
+      if (read_bufs.find(read->buffer.get()) == read_bufs.end()) {
+        new_reads.push_back(read);
+        read_bufs.insert(read->buffer.get());
+      }
+    }
+  }
+
+  new_block->reads = new_reads;
+
+  return Block(new_block);
+}
+
+/*!
+ * \brief Helper class to replace reduction and epilogue blocks with a single fused block
+ */
+class SingleBlockFusionReplacer : public StmtMutator {
+ public:
+  static Block Replace(Block old_scope_root, Block new_fused_block,
+                      Block old_reduction_block, Block old_epilogue_block,
+                      Buffer reduction_buffer) {
+    SingleBlockFusionReplacer replacer(std::move(new_fused_block),
+                                       std::move(old_reduction_block),
+                                       std::move(old_epilogue_block),
+                                       std::move(reduction_buffer));
+    Block result = Downcast<Block>(replacer(std::move(old_scope_root)));
+
+    // 중간 버퍼(temp) 제거
+    BlockNode* p = result.CopyOnWrite();
+    ffi::Array<Buffer> new_alloc_buffers;
+    for (const Buffer& buf : p->alloc_buffers) {
+      if (!buf.same_as(replacer.reduction_buffer_)) {
+        new_alloc_buffers.push_back(buf);
+      }
+    }
+    p->alloc_buffers = new_alloc_buffers;
+
+    return result;
+  }
+
+ private:
+  explicit SingleBlockFusionReplacer(Block new_fused_block, Block old_reduction_block,
+                                     Block old_epilogue_block, Buffer reduction_buffer)
+      : new_fused_block_(std::move(new_fused_block)),
+        old_reduction_block_(std::move(old_reduction_block)),
+        old_epilogue_block_(std::move(old_epilogue_block)),
+        reduction_buffer_(std::move(reduction_buffer)) {}
+
+  Stmt VisitStmt_(const ForNode* loop) final {
+    Stmt mutated_body = StmtMutator::VisitStmt(loop->body);
+    
+    // 빈 루프 제거 (Evaluate(0)만 포함하는 경우)
+    if (auto eval = mutated_body.as<EvaluateNode>()) {
+      return mutated_body;  // Evaluate(0)을 반환하면 SeqStmt에서 제거됨
+    }
+    
+    return For(loop->loop_var, loop->min, loop->extent, loop->kind, mutated_body,
+              loop->thread_binding, loop->annotations);
+  }
+
+  Stmt VisitStmt_(const BlockRealizeNode* realize) final {
+    if (realize->block.same_as(old_reduction_block_)) {
+      // Reduction 블록을 새로운 fused 블록으로 교체
+      ObjectPtr<BlockRealizeNode> new_realize = ffi::make_object<BlockRealizeNode>(*realize);
+      new_realize->block = new_fused_block_;
+      return BlockRealize(new_realize);
+    } else if (realize->block.same_as(old_epilogue_block_)) {
+      // Epilogue 블록 완전 제거
+      return Evaluate(0);
+    }
+    return StmtMutator::VisitStmt_(realize);
+  }
+
+  Stmt VisitStmt_(const SeqStmtNode* seq) final {
+    ffi::Array<Stmt> new_stmts;
+    for (const Stmt& stmt : seq->seq) {
+      Stmt new_stmt = VisitStmt(stmt);
+      // Evaluate(0)은 제거
+      if (!new_stmt.as<EvaluateNode>()) {
+        new_stmts.push_back(new_stmt);
+      }
+    }
+    return SeqStmt::Flatten(new_stmts);
+  }
+
+ private:
+  Block new_fused_block_;
+  Block old_reduction_block_;
+  Block old_epilogue_block_;
+  Buffer reduction_buffer_;
+};
+
+void FuseReductionEpilogueImpl(ScheduleState self, const StmtSRef& reduction_block_sref,
+                               const StmtSRef& epilogue_block_sref, bool check_only = false) {
+  const BlockNode* _reduction_block = TVM_SREF_TO_BLOCK(reduction_block_sref);
+  const BlockNode* _epilogue_block = TVM_SREF_TO_BLOCK(epilogue_block_sref);
+
+  Block reduction_block = ffi::GetRef<Block>(_reduction_block);
+  Block epilogue_block = ffi::GetRef<Block>(_epilogue_block);
+  BlockRealize epilogue_block_realize = GetBlockRealize(self, epilogue_block_sref);
+
+  // Step 1. Get the scope block
+  StmtSRef scope_root_sref =
+      GetScopeRoot(self, epilogue_block_sref, /*require_stage_pipeline=*/true);
+
+  // Step 2. Get the reduction buffer (intermediate buffer)
+  Buffer reduction_buffer =
+      NotSingleReadWriteBuffer::GetSingleWrite(self, reduction_block);
+
+  // Step 3. Check completeness and reduction block properties
+  CheckReductionBlock(self, reduction_block_sref, scope_root_sref);
+  CheckCompleteBlock(self, epilogue_block_sref, scope_root_sref);
+  CheckNotOutputBlock(self, reduction_block_sref, scope_root_sref);
+
+  // Step 4. Analyze the epilogue pattern
+  ReductionEpilogueFuser fuser(reduction_buffer, _reduction_block, epilogue_block_realize,
+                               scope_root_sref, self->mod);
+  if (!fuser.BodyPatternAllowFusion(epilogue_block_realize)) {
+    throw BodyAnalysisError(true, self->mod, epilogue_block);
+  }
+
+  if (check_only) {
+    return;
+  }
+
+  // Step 5. 단일 fused reduction 블록 생성
+  BlockRealize reduction_realize = GetBlockRealize(self, reduction_block_sref);
+  Block fused_block = fuser.CreateFusedReductionBlock(_reduction_block, reduction_realize.get());
+
+  // Step 6. IR 변환 및 교체
+  const BlockNode* old_scope_root = TVM_SREF_TO_BLOCK(scope_root_sref);
+
+  Block new_scope_root = SingleBlockFusionReplacer::Replace(
+      ffi::GetRef<Block>(old_scope_root), fused_block, reduction_block, epilogue_block,
+      reduction_buffer);
+
+  // Step 7. Schedule state 업데이트
+  ffi::Map<Block, Block> block_reuse;
+  block_reuse.Set(ffi::GetRef<Block>(old_scope_root), new_scope_root);
+  block_reuse.Set(reduction_block, fused_block);
+  self->Replace(scope_root_sref, new_scope_root, block_reuse);
+
+  // Step 8. BlockInfo 업데이트
+  self->UpdateScopeBlockInfo(GetBlockRealize(self, scope_root_sref));
+}
+
+void FuseReductionEpilogue(ScheduleState self, const StmtSRef& reduction_block_sref,
+                           const StmtSRef& epilogue_block_sref) {
+  FuseReductionEpilogueImpl(self, reduction_block_sref, epilogue_block_sref);
+}
+
 /******** InstructionKind Registration ********/
 
 struct ComputeInlineTraits : public UnpackedInstTraits<ComputeInlineTraits> {
@@ -1035,5 +1434,35 @@ struct ReverseComputeInlineTraits : public UnpackedInstTraits<ReverseComputeInli
 TVM_REGISTER_INST_KIND_TRAITS(ComputeInlineTraits);
 TVM_REGISTER_INST_KIND_TRAITS(ReverseComputeInlineTraits);
 
+struct FuseReductionEpilogueTraits : public UnpackedInstTraits<FuseReductionEpilogueTraits> {
+  static constexpr const char* kName = "FuseReductionEpilogue";
+  static constexpr bool kIsPure = false;
+
+ private:
+  static constexpr size_t kNumInputs = 2;
+  static constexpr size_t kNumAttrs = 0;
+  static constexpr size_t kNumDecisions = 0;
+
+  static void UnpackedApplyToSchedule(Schedule sch, BlockRV reduction_block_rv,
+                                      BlockRV epilogue_block_rv) {
+    return sch->FuseReductionEpilogue(reduction_block_rv, epilogue_block_rv);
+  }
+
+  static ffi::String UnpackedAsPython(ffi::Array<ffi::String> outputs,
+                                      ffi::String reduction_block_rv,
+                                      ffi::String epilogue_block_rv) {
+    PythonAPICall py("fuse_reduction_epilogue");
+    py.Input("reduction_block", reduction_block_rv);
+    py.Input("epilogue_block", epilogue_block_rv);
+    return py.Str();
+  }
+
+  template <typename>
+  friend struct ::tvm::tir::UnpackedInstTraits;
+};
+
+TVM_REGISTER_INST_KIND_TRAITS(FuseReductionEpilogueTraits);
+
 }  // namespace tir
 }  // namespace tvm
+
